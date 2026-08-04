@@ -34,12 +34,16 @@ def assemble():
         clip_path = f"{work_dir}/clip_{i}.mp4"
         subprocess.run([
             'ffmpeg', '-y', '-loop', '1', '-i', img_path, '-i', audio_path,
-            '-c:v', 'libx264', '-tune', 'stillimage', '-c:a', 'aac',
-            '-b:a', '192k', '-pix_fmt', 'yuv420p', '-shortest',
-            '-vf', 'scale=1920:1080',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
+            '-c:a', 'aac', '-b:a', '128k', '-pix_fmt', 'yuv420p', '-shortest',
+            '-vf', 'scale=1280:720',
             clip_path
         ], check=True)
         clip_paths.append(clip_path)
+
+        # прибираємо вихідні файли одразу, щоб не тримати зайве в памʼяті/диску
+        os.remove(img_path)
+        os.remove(audio_path)
 
     concat_list_path = f"{work_dir}/concat.txt"
     with open(concat_list_path, 'w') as f:
