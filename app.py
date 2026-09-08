@@ -9,6 +9,7 @@ import json
 app = Flask(__name__)
 
 FPS = 25
+FADE_DUR = 0.4  # seconds, fade in/out at each clip edge
 
 
 @app.route('/', methods=['GET'])
@@ -34,6 +35,7 @@ def assemble():
     os.makedirs(work_dir, exist_ok=True)
 
     clip_paths = []
+    n = len(scenes)
 
     for i, scene in enumerate(scenes):
         img_path = f"{work_dir}/img_{i}.jpg"
@@ -50,11 +52,18 @@ def assemble():
         duration = get_audio_duration(audio_path)
         total_frames = max(int(duration * FPS), 1)
 
-        # alternate zoom-in / zoom-out for visual variety between scenes
-        if i % 2 == 0:
-            zoom_expr = "min(zoom+0.0012,1.2)"
-        else:
-            zoom_expr = "if(eq(on,0),1.2,max(zoom-0.0012,1.0))"
+        # smooth continuous zoom-in, no starting jump: always starts at zoom=1.0
+        zoom_expr = "min(zoom+0.0012,1.2)"
+
+        # fade in at start of every clip except the very first,
+        # fade out at end of every clip except the very last
+        vf_fade = []
+        if i > 0:
+            vf_fade.append(f"fade=t=in:st=0:d={FADE_DUR}")
+        if i < n - 1:
+            fade_out_start = max(duration - FADE_DUR, 0)
+            vf_fade.append(f"fade=t=out:st={fade_out_start}:d={FADE_DUR}")
+        fade_chain = ("," + ",".join(vf_fade)) if vf_fade else ""
 
         clip_path = f"{work_dir}/clip_{i}.mp4"
         subprocess.run([
@@ -62,7 +71,7 @@ def assemble():
             '-filter_complex',
             f"[0:v]scale=1280:720,zoompan=z='{zoom_expr}':d={total_frames}"
             f":s=1280x720:fps={FPS}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
-            f"format=yuv420p[v]",
+            f"format=yuv420p{fade_chain}[v]",
             '-map', '[v]', '-map', '1:a',
             '-c:v', 'libx264', '-preset', 'ultrafast',
             '-c:a', 'aac', '-b:a', '128k',
