@@ -6,9 +6,11 @@ import uuid
 
 app = Flask(__name__)
 
+
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"status": "ok"})
+
 
 @app.route('/assemble', methods=['POST'])
 def assemble():
@@ -34,9 +36,9 @@ def assemble():
         clip_path = f"{work_dir}/clip_{i}.mp4"
         subprocess.run([
             'ffmpeg', '-y', '-loop', '1', '-i', img_path, '-i', audio_path,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
-            '-c:a', 'aac', '-b:a', '128k', '-pix_fmt', 'yuv420p', '-shortest',
-            '-vf', 'scale=1280:720',
+            '-c:v', 'libx264', '-preset', 'medium', '-tune', 'stillimage',
+            '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p', '-shortest',
+            '-vf', 'scale=1920:1080',
             clip_path
         ], check=True)
         clip_paths.append(clip_path)
@@ -57,6 +59,7 @@ def assemble():
     ], check=True)
 
     return send_file(output_path, mimetype='video/mp4')
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
