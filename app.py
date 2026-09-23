@@ -1,6 +1,5 @@
 from flask import Flask, request, send_file, jsonify
 import subprocess
-import requests
 import os
 import uuid
 import base64
@@ -29,7 +28,7 @@ def get_audio_duration(path):
 @app.route('/assemble', methods=['POST'])
 def assemble():
     data = request.json
-    scenes = data['scenes']  # [{image_url, audio_base64}, ...]
+    scenes = data['scenes']  # [{image_base64, audio_base64}, ...]
     job_id = str(uuid.uuid4())
     work_dir = f"/tmp/{job_id}"
     os.makedirs(work_dir, exist_ok=True)
@@ -41,7 +40,7 @@ def assemble():
         img_path = f"{work_dir}/img_{i}.jpg"
         audio_path = f"{work_dir}/audio_{i}.mp3"
 
-        img_data = requests.get(scene['image_url']).content
+        img_data = base64.b64decode(scene['image_base64'])
         with open(img_path, 'wb') as f:
             f.write(img_data)
 
@@ -52,11 +51,8 @@ def assemble():
         duration = get_audio_duration(audio_path)
         total_frames = max(int(duration * FPS), 1)
 
-        # smooth continuous zoom-in, no starting jump: always starts at zoom=1.0
         zoom_expr = "min(zoom+0.0012,1.2)"
 
-        # fade in at start of every clip except the very first,
-        # fade out at end of every clip except the very last
         vf_fade = []
         if i > 0:
             vf_fade.append(f"fade=t=in:st=0:d={FADE_DUR}")
