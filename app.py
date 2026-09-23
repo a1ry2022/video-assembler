@@ -1,10 +1,9 @@
 from flask import Flask, request, send_file, jsonify
 import subprocess
 import os
-import uuid
 import base64
 import json
-import re
+import shutil
 
 app = Flask(__name__)
 
@@ -13,6 +12,7 @@ FADE_DUR = 0.4
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 VIDEO_W = 720
 VIDEO_H = 1280
+JOBS_ROOT = "/tmp/jobs"
 
 
 @app.route('/', methods=['GET'])
@@ -58,63 +58,77 @@ def build_caption_filters(narration_text, duration):
     return "," + ",".join(filters)
 
 
-@app.route('/assemble', methods=['POST'])
-def assemble():
+@app.route('/add_scene', methods=['POST'])
+def add_scene():
+    """Build ONE clip from ONE scene and save it to disk. Keeps memory
+    footprint tiny since only one image+audio pair is ever held at once."""
     data = request.json
-    scenes = data['scenes']  # [{image_base64, audio_base64, narration_text}, ...]
-    job_id = str(uuid.uuid4())
-    work_dir = f"/tmp/{job_id}"
+    job_id = data['job_id']
+    index = int(data['scene_index'])
+    total = int(data['total_scenes'])
+    narration_text = data.get('narration_text', '')
+
+    work_dir = f"{JOBS_ROOT}/{job_id}"
     os.makedirs(work_dir, exist_ok=True)
 
-    clip_paths = []
-    n = len(scenes)
+    img_path = f"{work_dir}/img_{index}.jpg"
+    audio_path = f"{work_dir}/audio_{index}.mp3"
 
-    for i, scene in enumerate(scenes):
-        img_path = f"{work_dir}/img_{i}.jpg"
-        audio_path = f"{work_dir}/audio_{i}.mp3"
+    with open(img_path, 'wb') as f:
+        f.write(base64.b64decode(data['image_base64']))
+    with open(audio_path, 'wb') as f:
+        f.write(base64.b64decode(data['audio_base64']))
 
-        img_data = base64.b64decode(scene['image_base64'])
-        with open(img_path, 'wb') as f:
-            f.write(img_data)
+    duration = get_audio_duration(audio_path)
+    total_frames = max(int(duration * FPS), 1)
+    zoom_expr = "min(zoom+0.0012,1.2)"
 
-        audio_data = base64.b64decode(scene['audio_base64'])
-        with open(audio_path, 'wb') as f:
-            f.write(audio_data)
+    vf_fade = []
+    if index > 0:
+        vf_fade.append(f"fade=t=in:st=0:d={FADE_DUR}")
+    if index < total - 1:
+        fade_out_start = max(duration - FADE_DUR, 0)
+        vf_fade.append(f"fade=t=out:st={fade_out_start}:d={FADE_DUR}")
+    fade_chain = ("," + ",".join(vf_fade)) if vf_fade else ""
 
-        duration = get_audio_duration(audio_path)
-        total_frames = max(int(duration * FPS), 1)
+    caption_chain = build_caption_filters(narration_text, duration)
 
-        zoom_expr = "min(zoom+0.0012,1.2)"
+    clip_path = f"{work_dir}/clip_{index}.mp4"
+    subprocess.run([
+        'ffmpeg', '-y', '-loop', '1', '-i', img_path, '-i', audio_path,
+        '-filter_complex',
+        f"[0:v]scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_W}:{VIDEO_H},"
+        f"zoompan=z='{zoom_expr}':d={total_frames}"
+        f":s={VIDEO_W}x{VIDEO_H}:fps={FPS}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
+        f"format=yuv420p{fade_chain}{caption_chain}[v]",
+        '-map', '[v]', '-map', '1:a',
+        '-c:v', 'libx264', '-preset', 'ultrafast',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-t', str(duration),
+        clip_path
+    ], check=True)
 
-        vf_fade = []
-        if i > 0:
-            vf_fade.append(f"fade=t=in:st=0:d={FADE_DUR}")
-        if i < n - 1:
-            fade_out_start = max(duration - FADE_DUR, 0)
-            vf_fade.append(f"fade=t=out:st={fade_out_start}:d={FADE_DUR}")
-        fade_chain = ("," + ",".join(vf_fade)) if vf_fade else ""
+    os.remove(img_path)
+    os.remove(audio_path)
 
-        caption_chain = build_caption_filters(scene.get('narration_text', ''), duration)
+    return jsonify({"status": "ok", "job_id": job_id, "index": index})
 
-        clip_path = f"{work_dir}/clip_{i}.mp4"
-        subprocess.run([
-            'ffmpeg', '-y', '-loop', '1', '-i', img_path, '-i', audio_path,
-            '-filter_complex',
-            f"[0:v]scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
-            f"crop={VIDEO_W}:{VIDEO_H},"
-            f"zoompan=z='{zoom_expr}':d={total_frames}"
-            f":s={VIDEO_W}x{VIDEO_H}:fps={FPS}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
-            f"format=yuv420p{fade_chain}{caption_chain}[v]",
-            '-map', '[v]', '-map', '1:a',
-            '-c:v', 'libx264', '-preset', 'ultrafast',
-            '-c:a', 'aac', '-b:a', '128k',
-            '-t', str(duration),
-            clip_path
-        ], check=True)
-        clip_paths.append(clip_path)
 
-        os.remove(img_path)
-        os.remove(audio_path)
+@app.route('/finalize', methods=['POST'])
+def finalize():
+    """Concat all clips already saved on disk for this job into the final
+    video. Only touches small files on disk, never holds base64 in memory."""
+    data = request.json
+    job_id = data['job_id']
+    total = int(data['total_scenes'])
+
+    work_dir = f"{JOBS_ROOT}/{job_id}"
+    clip_paths = [f"{work_dir}/clip_{i}.mp4" for i in range(total)]
+
+    missing = [p for p in clip_paths if not os.path.exists(p)]
+    if missing:
+        return jsonify({"error": f"missing clips: {missing}"}), 400
 
     concat_list_path = f"{work_dir}/concat.txt"
     with open(concat_list_path, 'w') as f:
@@ -127,10 +141,13 @@ def assemble():
         '-i', concat_list_path, '-c', 'copy', output_path
     ], check=True)
 
-    for cp in clip_paths:
-        os.remove(cp)
+    response = send_file(output_path, mimetype='video/mp4')
 
-    return send_file(output_path, mimetype='video/mp4')
+    @response.call_on_close
+    def cleanup():
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    return response
 
 
 if __name__ == '__main__':
