@@ -30,8 +30,9 @@ def get_audio_duration(path):
 
 @app.route('/add_scene', methods=['POST'])
 def add_scene():
-    """Build ONE clip from ONE scene and save it to disk. Keeps memory
-    footprint tiny since only one image+audio pair is ever held at once."""
+    """Build ONE clip from ONE scene: static image + audio, no zoom/pan.
+    Keeps memory footprint minimal and predictable regardless of scene
+    length, since there is no per-frame filter work at all."""
     data = request.json
     job_id = data['job_id']
     index = int(data['scene_index'])
@@ -49,17 +50,6 @@ def add_scene():
         f.write(base64.b64decode(data['audio_base64']))
 
     duration = get_audio_duration(audio_path)
-    total_frames = max(int(duration * FPS), 1)
-    zoom_expr = "min(zoom+0.0012,1.2)"
-
-    # zoompan's memory use grows with its frame count (d), so cap the
-    # actual zoom to the first ZOOM_SECONDS and hold the last frame for
-    # the remainder via tpad instead of running zoompan over the whole
-    # (possibly 30s+) clip.
-    ZOOM_SECONDS = 8
-    zoom_frames = min(total_frames, int(ZOOM_SECONDS * FPS))
-    hold_duration = max(duration - ZOOM_SECONDS, 0)
-    tpad_chain = f",tpad=stop_mode=clone:stop_duration={hold_duration:.2f}" if hold_duration > 0 else ""
 
     vf_fade = []
     if index > 0:
@@ -72,14 +62,10 @@ def add_scene():
     clip_path = f"{work_dir}/clip_{index}.mp4"
     subprocess.run([
         'ffmpeg', '-y', '-loop', '1', '-i', img_path, '-i', audio_path,
-        '-filter_complex',
-        f"[0:v]scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
-        f"crop={VIDEO_W}:{VIDEO_H},"
-        f"zoompan=z='{zoom_expr}':d={zoom_frames}"
-        f":s={VIDEO_W}x{VIDEO_H}:fps={FPS}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-        f"{tpad_chain},"
-        f"format=yuv420p{fade_chain}[v]",
-        '-map', '[v]', '-map', '1:a',
+        '-vf',
+        f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_W}:{VIDEO_H},format=yuv420p{fade_chain}",
+        '-r', str(FPS),
         '-c:v', 'libx264', '-preset', 'ultrafast',
         '-c:a', 'aac', '-b:a', '128k',
         '-t', str(duration),
