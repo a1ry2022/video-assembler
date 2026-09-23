@@ -4,6 +4,7 @@ import os
 import base64
 import json
 import shutil
+import threading
 
 app = Flask(__name__)
 
@@ -12,6 +13,7 @@ FADE_DUR = 0.4
 VIDEO_W = 720
 VIDEO_H = 1280
 JOBS_ROOT = "/tmp/jobs"
+ffmpeg_lock = threading.Lock()
 
 
 @app.route('/', methods=['GET'])
