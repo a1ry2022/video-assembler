@@ -11,8 +11,8 @@ app = Flask(__name__)
 FPS = 25
 FADE_DUR = 0.4
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-VIDEO_W = 1080
-VIDEO_H = 1920
+VIDEO_W = 720
+VIDEO_H = 1280
 
 
 @app.route('/', methods=['GET'])
