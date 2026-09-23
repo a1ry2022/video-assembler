@@ -9,7 +9,6 @@ app = Flask(__name__)
 
 FPS = 25
 FADE_DUR = 0.4
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 VIDEO_W = 720
 VIDEO_H = 1280
 JOBS_ROOT = "/tmp/jobs"
@@ -29,35 +28,6 @@ def get_audio_duration(path):
     return float(info['format']['duration'])
 
 
-def escape_drawtext(text):
-    return (text.replace('\\', '\\\\')
-                .replace(':', '\\:')
-                .replace("'", "\u2019")
-                .replace('%', '\\%'))
-
-
-def build_caption_filters(narration_text, duration):
-    words = narration_text.split()
-    if not words:
-        return ""
-    chunk_size = 3
-    chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
-    n = len(chunks)
-    seg_dur = duration / n
-    filters = []
-    for i, chunk in enumerate(chunks):
-        start = i * seg_dur
-        end = start + seg_dur
-        safe_text = escape_drawtext(chunk.upper())
-        filters.append(
-            f"drawtext=fontfile={FONT_PATH}:text='{safe_text}':"
-            f"fontsize=64:fontcolor=white:borderw=6:bordercolor=black:"
-            f"x=(w-text_w)/2:y=h*0.75:"
-            f"enable='between(t,{start:.2f},{end:.2f})'"
-        )
-    return "," + ",".join(filters)
-
-
 @app.route('/add_scene', methods=['POST'])
 def add_scene():
     """Build ONE clip from ONE scene and save it to disk. Keeps memory
@@ -66,7 +36,6 @@ def add_scene():
     job_id = data['job_id']
     index = int(data['scene_index'])
     total = int(data['total_scenes'])
-    narration_text = data.get('narration_text', '')
 
     work_dir = f"{JOBS_ROOT}/{job_id}"
     os.makedirs(work_dir, exist_ok=True)
@@ -83,6 +52,15 @@ def add_scene():
     total_frames = max(int(duration * FPS), 1)
     zoom_expr = "min(zoom+0.0012,1.2)"
 
+    # zoompan's memory use grows with its frame count (d), so cap the
+    # actual zoom to the first ZOOM_SECONDS and hold the last frame for
+    # the remainder via tpad instead of running zoompan over the whole
+    # (possibly 30s+) clip.
+    ZOOM_SECONDS = 8
+    zoom_frames = min(total_frames, int(ZOOM_SECONDS * FPS))
+    hold_duration = max(duration - ZOOM_SECONDS, 0)
+    tpad_chain = f",tpad=stop_mode=clone:stop_duration={hold_duration:.2f}" if hold_duration > 0 else ""
+
     vf_fade = []
     if index > 0:
         vf_fade.append(f"fade=t=in:st=0:d={FADE_DUR}")
@@ -91,17 +69,16 @@ def add_scene():
         vf_fade.append(f"fade=t=out:st={fade_out_start}:d={FADE_DUR}")
     fade_chain = ("," + ",".join(vf_fade)) if vf_fade else ""
 
-    caption_chain = build_caption_filters(narration_text, duration)
-
     clip_path = f"{work_dir}/clip_{index}.mp4"
     subprocess.run([
         'ffmpeg', '-y', '-loop', '1', '-i', img_path, '-i', audio_path,
         '-filter_complex',
         f"[0:v]scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
         f"crop={VIDEO_W}:{VIDEO_H},"
-        f"zoompan=z='{zoom_expr}':d={total_frames}"
-        f":s={VIDEO_W}x{VIDEO_H}:fps={FPS}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
-        f"format=yuv420p{fade_chain}{caption_chain}[v]",
+        f"zoompan=z='{zoom_expr}':d={zoom_frames}"
+        f":s={VIDEO_W}x{VIDEO_H}:fps={FPS}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f"{tpad_chain},"
+        f"format=yuv420p{fade_chain}[v]",
         '-map', '[v]', '-map', '1:a',
         '-c:v', 'libx264', '-preset', 'ultrafast',
         '-c:a', 'aac', '-b:a', '128k',
