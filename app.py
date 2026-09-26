@@ -16,12 +16,15 @@ log = app.logger
 
 # ---------- video settings ----------
 FPS = 25
-VIDEO_W = 720
-VIDEO_H = 1280
+VIDEO_W = 1080
+VIDEO_H = 1920
 ZOOM_AMOUNT = 0.22          # how much each shot zooms in over its duration
-OVERSAMPLE = 2              # zoompan works on a 2x image to reduce jitter
+OVERSAMPLE = 1.5            # zoompan works on an upscaled image to reduce jitter
 
 # ---------- caption settings ----------
+# Caption sizes are defined on a 720x1280 canvas; libass scales them to the real video size.
+CAPTION_CANVAS_W = 720
+CAPTION_CANVAS_H = 1280
 CAPTION_FONT = "DejaVu Sans"
 CAPTION_SIZE = 78
 CAPTION_OUTLINE = 6
@@ -31,6 +34,10 @@ CAPTION_UPPERCASE = True
 # ---------- music ----------
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "/app/music")
 MUSIC_VOLUME = 0.12
+
+# ---------- audio trim ----------
+LEAD_PAD = 0.05             # keep this much silence before the first word
+TAIL_PAD = 0.15             # keep this much after the last word
 
 JOBS_ROOT = os.environ.get("JOBS_ROOT", "/tmp/jobs")
 SCENE_TIMEOUT = 480
@@ -139,8 +146,8 @@ def ass_time(t):
 def write_ass(path, words):
     header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: {VIDEO_W}
-PlayResY: {VIDEO_H}
+PlayResX: {CAPTION_CANVAS_W}
+PlayResY: {CAPTION_CANVAS_H}
 WrapStyle: 2
 ScaledBorderAndShadow: yes
 
@@ -223,6 +230,22 @@ def add_scene():
     try:
         duration = get_duration(audio_path)
         scene_text = ' '.join(shot_texts)
+
+        # Trim dead air at the start/end of the scene using ElevenLabs timings,
+        # so scenes join without pauses between them.
+        audio_offset = 0.0
+        al_s = (alignment or {}).get('character_start_times_seconds') or []
+        al_e = (alignment or {}).get('character_end_times_seconds') or []
+        if al_s and al_e and len(al_s) == len(al_e):
+            audio_offset = max(min(al_s) - LEAD_PAD, 0.0)
+            speech_end = min(max(al_e) + TAIL_PAD, duration)
+            if speech_end - audio_offset > 0.5:
+                alignment = dict(alignment)
+                alignment['character_start_times_seconds'] = [max(t - audio_offset, 0) for t in al_s]
+                alignment['character_end_times_seconds'] = [max(t - audio_offset, 0) for t in al_e]
+                duration = speech_end - audio_offset
+            else:
+                audio_offset = 0.0
         times = char_times(scene_text, alignment, duration)
         bounds = shot_boundaries(shot_texts, times, duration)
         write_ass(ass_path, word_timings(scene_text, times, alignment, duration))
@@ -239,7 +262,7 @@ def add_scene():
             frames.append(n)
             acc += n
 
-        big_w, big_h = VIDEO_W * OVERSAMPLE, VIDEO_H * OVERSAMPLE
+        big_w, big_h = int(VIDEO_W * OVERSAMPLE) // 2 * 2, int(VIDEO_H * OVERSAMPLE) // 2 * 2
         inputs, chains = [], []
         for i, (img, n) in enumerate(zip(img_paths, frames)):
             inputs += ['-i', img]
@@ -257,10 +280,10 @@ def add_scene():
         chains.append(f"[vc]subtitles={ass_path}:fontsdir=/usr/share/fonts,format=yuv420p[vout]")
 
         args = inputs + [
-            '-i', audio_path,
+            '-ss', f"{audio_offset:.3f}", '-i', audio_path,
             '-filter_complex', ';'.join(chains),
             '-map', '[vout]', '-map', f'{n_shots}:a',
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-threads', '2',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-threads', '2',
             '-r', str(FPS),
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '1',
             '-t', f"{duration:.3f}",
@@ -315,7 +338,22 @@ def finalize():
 
     joined = f"{work_dir}/joined.mp4"
     output = f"{work_dir}/output.mp4"
-    tracks = sorted(glob.glob(f"{MUSIC_DIR}/*.mp3"))
+    # Music: a track sent with the request wins; otherwise pick from the library.
+    music_file = None
+    if data.get('music_base64'):
+        try:
+            music_file = f"{work_dir}/music.mp3"
+            with open(music_file, 'wb') as f:
+                f.write(base64.b64decode(data['music_base64']))
+        except (ValueError, TypeError):
+            music_file = None
+
+    mood = re.sub(r'[^a-z_\-]', '', str(data.get('music_mood') or '').lower())
+    tracks = sorted(glob.glob(f"{MUSIC_DIR}/{mood}/*.mp3")) if mood else []
+    if not tracks:
+        tracks = sorted(glob.glob(f"{MUSIC_DIR}/**/*.mp3", recursive=True))
+    if music_file:
+        tracks = [music_file]
 
     try:
         with ffmpeg_lock:
@@ -325,16 +363,23 @@ def finalize():
                 music = random.choice(tracks)
                 dur = get_duration(joined)
                 fade_st = max(dur - 2, 0)
-                run_ffmpeg([
+                try:
+                  run_ffmpeg([
                     '-i', joined, '-stream_loop', '-1', '-i', music,
                     '-filter_complex',
-                    f"[1:a]volume={MUSIC_VOLUME},afade=t=out:st={fade_st:.2f}:d=2[m];"
+                    f"[1:a]volume={MUSIC_VOLUME},afade=t=in:st=0:d=1,afade=t=out:st={fade_st:.2f}:d=2[m];"
                     f"[0:a][m]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]",
                     '-map', '0:v', '-map', '[a]',
                     '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k',
                     '-t', f"{dur:.3f}", '-movflags', '+faststart', output
-                ], timeout=FINALIZE_TIMEOUT)
-                log.info(f"[{job_id}] music: {os.path.basename(music)}")
+                  ], timeout=FINALIZE_TIMEOUT)
+                except FFmpegError as e:
+                    # a broken music file must not cost us the whole video
+                    log.error(f"[{job_id}] music mix failed, publishing without music: {e}")
+                    os.replace(joined, output)
+                    music = None
+                if music:
+                  log.info(f"[{job_id}] music: " + ("generated" if music == music_file else f"library ({mood or 'any'}) {os.path.relpath(music, MUSIC_DIR)}"))
             else:
                 os.replace(joined, output)
     except subprocess.TimeoutExpired:
