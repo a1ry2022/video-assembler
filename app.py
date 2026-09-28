@@ -203,9 +203,14 @@ def add_image():
         work_dir = job_dir(data['job_id'])
         scene = int(data['scene_index'])
         shot = int(data['shot_index'])
-        raw = base64.b64decode(data['image_base64'])
+        b64 = data.get('image_base64') or ''
+        raw = base64.b64decode(b64) if b64 else b''
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({"error": f"bad request: {e}"}), 400
+
+    if len(raw) < 1000:
+        # the image failed upstream; /add_scene will use a neighbouring frame
+        return jsonify({"status": "skipped", "scene_index": scene, "shot_index": shot})
 
     path = f"{work_dir}/img_{scene}_{shot}.jpg"
     tmp = path + ".tmp"
@@ -238,9 +243,25 @@ def add_scene():
         return jsonify({"status": "ok", "job_id": job_id, "index": index, "cached": True})
 
     img_paths = [f"{work_dir}/img_{index}_{i}.jpg" for i in range(len(shot_texts))]
-    missing = [i for i, p in enumerate(img_paths) if not os.path.exists(p)]
-    if missing:
-        return jsonify({"error": "missing images", "scene_index": index, "missing_shots": missing}), 400
+    # Fallback: a missing frame borrows the nearest frame of the same scene,
+    # or the last frame of the previous scene if the whole scene is missing.
+    have = [i for i, p in enumerate(img_paths) if os.path.exists(p)]
+    last_frame = f"{work_dir}/last_frame.jpg"
+    fallback_shots = []
+    if len(have) < len(img_paths):
+        for i, p in enumerate(img_paths):
+            if os.path.exists(p):
+                continue
+            if have:
+                src = img_paths[min(have, key=lambda h: (abs(h - i), h > i))]
+            elif os.path.exists(last_frame):
+                src = last_frame
+            else:
+                return jsonify({"error": "missing images", "scene_index": index,
+                                "missing_shots": list(range(len(img_paths)))}), 400
+            shutil.copyfile(src, p)
+            fallback_shots.append(i)
+        log.warning(f"[{job_id}] scene {index}: fallback frames for shots {fallback_shots}")
 
     audio_path = f"{work_dir}/audio_{index}.mp3"
     ass_path = f"{work_dir}/subs_{index}.ass"
@@ -360,10 +381,15 @@ def add_scene():
     finally:
         safe_remove(audio_path)
 
+    try:
+        shutil.copyfile(img_paths[-1], last_frame)   # for a later scene that has no images at all
+    except OSError:
+        pass
     for p in img_paths:
         safe_remove(p)
     return jsonify({"status": "ok", "job_id": job_id, "index": index,
-                    "duration": round(duration, 2), "shots": len(img_paths)})
+                    "duration": round(duration, 2), "shots": len(img_paths),
+                    "fallback_shots": fallback_shots})
 
 
 @app.route('/finalize', methods=['POST'])
