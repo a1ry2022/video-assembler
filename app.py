@@ -37,6 +37,11 @@ CAPTION_UPPERCASE = True
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "/app/music")
 MUSIC_VOLUME = 0.12
 
+# ---------- captions highlight + sound effects ----------
+HIGHLIGHT_COLOR = "&H0000D7FF"   # ASS is BGR: this is gold/yellow
+SFX_DIR = os.environ.get("SFX_DIR", "/app/sfx")
+SFX_VOLUME = 0.35               # whoosh on every cut; hit on the very first frame
+
 # ---------- audio trim ----------
 LEAD_PAD = 0.05             # keep this much silence before the first word
 TAIL_PAD = 0.15             # keep this much after the last word
@@ -154,7 +159,7 @@ def ass_time(t):
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def write_ass(path, words):
+def write_ass(path, words, highlight=None):
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {CAPTION_CANVAS_W}
@@ -169,11 +174,16 @@ Style: Word,{CAPTION_FONT},{CAPTION_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H640
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+    norm = lambda w: re.sub(r'[^\w%$#]+', '', str(w)).lower()
+    hl = {norm(w) for w in (highlight or []) if norm(w)}
     lines = []
     for word, start, end in words:
         text = word.upper() if CAPTION_UPPERCASE else word
         text = text.replace('{', '').replace('}', '')
-        pop = r"{\fscx118\fscy118\t(0,90,\fscx100\fscy100)}"
+        if norm(word) in hl:
+            pop = r"{\c" + HIGHLIGHT_COLOR + r"&\fscx130\fscy130\t(0,110,\fscx108\fscy108)}"
+        else:
+            pop = r"{\fscx118\fscy118\t(0,90,\fscx100\fscy100)}"
         lines.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Word,,0,0,0,,{pop}{text}")
     with open(path, 'w', encoding='utf-8') as f:
         f.write(header + "\n".join(lines) + "\n")
@@ -217,6 +227,7 @@ def add_scene():
         total = int(data['total_scenes'])
         shot_texts = [str(t).strip() for t in data['shot_texts']]
         alignment = data.get('alignment')
+        highlight = data.get('highlight_words') or []
         audio_raw = base64.b64decode(data['audio_base64'])
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({"error": f"bad request: {e}"}), 400
@@ -259,7 +270,7 @@ def add_scene():
                 audio_offset = 0.0
         times = char_times(scene_text, alignment, duration)
         bounds = shot_boundaries(shot_texts, times, duration)
-        write_ass(ass_path, word_timings(scene_text, times, alignment, duration))
+        write_ass(ass_path, word_timings(scene_text, times, alignment, duration), highlight)
 
         # frame counts per shot, summing exactly to the audio length
         total_frames = max(int(round(duration * FPS)), 1)
@@ -290,10 +301,39 @@ def add_scene():
         chains.append(f"{concat_in}concat=n={n_shots}:v=1:a=0[vc]")
         chains.append(f"[vc]subtitles={ass_path}:fontsdir=/usr/share/fonts,format=yuv420p[vout]")
 
-        args = inputs + [
-            '-ss', f"{audio_offset:.3f}", '-i', audio_path,
+        # voice + optional sound effects
+        audio_inputs = ['-ss', f"{audio_offset:.3f}", '-i', audio_path]
+        a_idx = n_shots
+        chains.append(f"[{a_idx}:a]aformat=sample_rates=44100:channel_layouts=mono[voice]")
+        mix = ['[voice]']
+        whoosh = f"{SFX_DIR}/whoosh.mp3"
+        hit = f"{SFX_DIR}/hit.mp3"
+        cuts = [s_ for (s_, e_) in bounds[1:] if s_ > 0.2]
+        next_idx = a_idx + 1
+        if os.path.exists(whoosh) and cuts:
+            audio_inputs += ['-i', whoosh]
+            labels = ''.join(f"[w{k}]" for k in range(len(cuts)))
+            chains.append(f"[{next_idx}:a]aformat=sample_rates=44100:channel_layouts=mono,"
+                          f"volume={SFX_VOLUME},asplit={len(cuts)}{labels}" if len(cuts) > 1 else
+                          f"[{next_idx}:a]aformat=sample_rates=44100:channel_layouts=mono,volume={SFX_VOLUME}[w0]")
+            for k, t in enumerate(cuts):
+                ms = int(max(t - 0.12, 0) * 1000)
+                chains.append(f"[w{k}]adelay=delays={ms}:all=1[wd{k}]")
+                mix.append(f"[wd{k}]")
+            next_idx += 1
+        if os.path.exists(hit) and index == 0:
+            audio_inputs += ['-i', hit]
+            chains.append(f"[{next_idx}:a]aformat=sample_rates=44100:channel_layouts=mono,volume={SFX_VOLUME * 1.3:.2f}[hd]")
+            mix.append('[hd]')
+            next_idx += 1
+        if len(mix) > 1:
+            chains.append(f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:dropout_transition=0:normalize=0[aout]")
+        else:
+            chains.append("[voice]anull[aout]")
+
+        args = inputs + audio_inputs + [
             '-filter_complex', ';'.join(chains),
-            '-map', '[vout]', '-map', f'{n_shots}:a',
+            '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-threads', '2',
             '-r', str(FPS),
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '1',
