@@ -10,6 +10,7 @@ import shutil
 import threading
 import logging
 import time
+import requests
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -584,7 +585,18 @@ def grab_frame(video, out, at=1.5):
 
 
 def set_status(cid, **kw):
-    st = COMPILES.setdefault(cid, {"compile_id": cid})
+    if cid not in COMPILES:
+        # after a server restart, continue from what is on disk instead of overwriting it
+        p = f"{COMPILES_DIR}/{cid}/status.json"
+        base = {"compile_id": cid}
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    base = json.load(f)
+            except Exception:
+                pass
+        COMPILES[cid] = base
+    st = COMPILES[cid]
     st.update(kw)
     st['updated'] = time.time()
     os.makedirs(f"{COMPILES_DIR}/{cid}", exist_ok=True)
@@ -719,6 +731,196 @@ def compile_video(cid):
     if not re.fullmatch(r'[A-Za-z0-9_\-]+', cid) or not os.path.exists(p):
         return jsonify({"error": "not ready"}), 404
     return send_file(p, mimetype='video/mp4')
+
+
+
+# =====================================================================
+# Upload the long video straight from this server to YouTube
+# (a 10-minute 1080p file is too big to pass through n8n Cloud memory)
+# Env vars on Render: YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN
+# =====================================================================
+
+def yt_access_token():
+    r = requests.post('https://oauth2.googleapis.com/token', data={
+        'client_id': os.environ['YT_CLIENT_ID'],
+        'client_secret': os.environ['YT_CLIENT_SECRET'],
+        'refresh_token': os.environ['YT_REFRESH_TOKEN'],
+        'grant_type': 'refresh_token',
+    }, timeout=30)
+    r.raise_for_status()
+    return r.json()['access_token']
+
+
+@app.route('/compile/<cid>/youtube', methods=['POST'])
+def compile_youtube(cid):
+    """Body: title, description, tags (list or comma string), privacy (public/private/unlisted)."""
+    if not re.fullmatch(r'[A-Za-z0-9_\-]+', cid):
+        return jsonify({"error": "bad compile_id"}), 400
+    path = f"{COMPILES_DIR}/{cid}/long.mp4"
+    if not os.path.exists(path):
+        return jsonify({"error": "video not ready"}), 404
+
+    st = COMPILES.get(cid) or {}
+    if not st:
+        sp = f"{COMPILES_DIR}/{cid}/status.json"
+        if os.path.exists(sp):
+            with open(sp) as f:
+                st = json.load(f)
+    if st.get('youtube_id'):
+        # already uploaded: do not upload twice on a retry
+        return jsonify({"status": "ok", "youtube_id": st['youtube_id'], "cached": True})
+
+    data = request.get_json(force=True)
+    tags = data.get('tags') or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(',') if t.strip()]
+    kept, total = [], 0
+    for t in tags:
+        total += len(t) + 1
+        if total > 450:
+            break
+        kept.append(t)
+
+    meta = {
+        "snippet": {
+            "title": str(data.get('title') or 'Cosmic Unknown')[:100],
+            "description": str(data.get('description') or '')[:4900],
+            "tags": kept,
+            "categoryId": str(data.get('category_id') or '28'),
+            "defaultLanguage": "en",
+            "defaultAudioLanguage": "en",
+        },
+        "status": {
+            "privacyStatus": data.get('privacy') or 'public',
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+    size = os.path.getsize(path)
+    try:
+        token = yt_access_token()
+        init = requests.post(
+            'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json; charset=UTF-8',
+                'X-Upload-Content-Type': 'video/mp4',
+                'X-Upload-Content-Length': str(size),
+            },
+            json=meta, timeout=60)
+        if init.status_code >= 300:
+            return jsonify({"error": "youtube init failed", "detail": init.text[-1500:]}), 502
+        location = init.headers['Location']
+        with open(path, 'rb') as f:
+            put = requests.put(location, data=f, headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'video/mp4',
+                'Content-Length': str(size),
+            }, timeout=1800)
+        if put.status_code >= 300:
+            return jsonify({"error": "youtube upload failed", "detail": put.text[-1500:]}), 502
+        vid = put.json().get('id')
+    except KeyError as e:
+        return jsonify({"error": f"missing env var or header: {e}"}), 500
+    except requests.RequestException as e:
+        return jsonify({"error": "youtube request error", "detail": str(e)[-1500:]}), 502
+
+    set_status(cid, youtube_id=vid)
+    log.info(f"[{cid}] uploaded to YouTube: {vid}")
+    return jsonify({"status": "ok", "youtube_id": vid, "url": f"https://youtu.be/{vid}"})
+
+
+
+# =====================================================================
+# Thumbnail for the long video: image + big text, then set it on YouTube
+# =====================================================================
+
+THUMB_W, THUMB_H = 1280, 720
+
+
+def compose_thumbnail(src, out, text):
+    ass = out.replace('.jpg', '.ass')
+    words = ass_escape(text).upper().strip()
+    with open(ass, 'w', encoding='utf-8') as f:
+        f.write(f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {THUMB_W}
+PlayResY: {THUMB_H}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: T,{CAPTION_FONT},118,&H0000D7FF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,10,5,4,60,560,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:05.00,T,,0,0,0,,{words}
+""")
+    # soft dark gradient on the left so the text reads on any image
+    fc = (f"[0:v]scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=increase,crop={THUMB_W}:{THUMB_H},"
+          f"eq=saturation=1.15:contrast=1.08,format=rgba[base];"
+          f"color=black:s={THUMB_W}x{THUMB_H},format=rgba,"
+          f"geq=r=0:g=0:b=0:a='190*max(0\\,1-X/(W*0.7))'[shade];"
+          f"[base][shade]overlay=0:0,subtitles={ass}:fontsdir=/usr/share/fonts,format=yuvj420p[out]")
+    with ffmpeg_lock:
+        run_ffmpeg(['-i', src, '-filter_complex', fc, '-map', '[out]', '-frames:v', '1', '-q:v', '2', out], timeout=60)
+    safe_remove(ass)
+    return out
+
+
+@app.route('/compile/<cid>/thumbnail', methods=['POST'])
+def compile_thumbnail(cid):
+    """Body: image_base64, text, video_id (optional, defaults to the uploaded long video)."""
+    if not re.fullmatch(r'[A-Za-z0-9_\-]+', cid):
+        return jsonify({"error": "bad compile_id"}), 400
+    work = f"{COMPILES_DIR}/{cid}"
+    os.makedirs(work, exist_ok=True)
+    data = request.get_json(force=True)
+
+    st = COMPILES.get(cid) or {}
+    if not st and os.path.exists(f"{work}/status.json"):
+        with open(f"{work}/status.json") as f:
+            st = json.load(f)
+    video_id = data.get('video_id') or st.get('youtube_id')
+    if not video_id:
+        return jsonify({"error": "no video id: upload the video first"}), 400
+
+    src = f"{work}/thumb_src.jpg"
+    out = f"{work}/thumb.jpg"
+    try:
+        with open(src, 'wb') as f:
+            f.write(base64.b64decode(data['image_base64']))
+        compose_thumbnail(src, out, data.get('text') or '')
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({"error": f"bad request: {e}"}), 400
+    except FFmpegError as e:
+        return jsonify({"error": "thumbnail render failed", "detail": str(e)}), 500
+
+    try:
+        token = yt_access_token()
+        with open(out, 'rb') as f:
+            r = requests.post(
+                f'https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={video_id}&uploadType=media',
+                headers={'Authorization': f'Bearer {token}', 'Content-Type': 'image/jpeg'},
+                data=f.read(), timeout=120)
+        if r.status_code >= 300:
+            return jsonify({"error": "youtube thumbnail failed", "detail": r.text[-1500:]}), 502
+    except KeyError as e:
+        return jsonify({"error": f"missing env var: {e}"}), 500
+    except requests.RequestException as e:
+        return jsonify({"error": "youtube request error", "detail": str(e)[-1500:]}), 502
+
+    set_status(cid, thumbnail_set=True)
+    log.info(f"[{cid}] thumbnail set on {video_id}")
+    return jsonify({"status": "ok", "video_id": video_id})
+
+
+@app.route('/compile/<cid>/thumbnail.jpg', methods=['GET'])
+def compile_thumbnail_preview(cid):
+    p = f"{COMPILES_DIR}/{cid}/thumb.jpg"
+    if not re.fullmatch(r'[A-Za-z0-9_\-]+', cid) or not os.path.exists(p):
+        return jsonify({"error": "no thumbnail"}), 404
+    return send_file(p, mimetype='image/jpeg')
 
 
 if __name__ == '__main__':
