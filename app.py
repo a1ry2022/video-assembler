@@ -494,6 +494,7 @@ def library_save(job_id, video_path, data):
         "created": time.time(),
         "duration": round(get_duration(video_path), 2),
         "used": False,
+        "channel": re.sub(r'[^a-z0-9_\-]', '', str(data.get('channel') or 'cosmic').lower()) or 'cosmic',
     }
     with open(f"{SHORTS_DIR}/{job_id}.json", 'w') as f:
         json.dump(meta, f)
@@ -523,10 +524,25 @@ def library_cleanup():
 
 @app.route('/library', methods=['GET'])
 def library():
+    """?channel=cosmic returns only that channel; Shorts saved before channels existed count as cosmic."""
+    channel = (request.args.get('channel') or '').lower()
     items = [m for m in library_items() if m['has_video']]
+    if channel:
+        items = [m for m in items if (m.get('channel') or 'cosmic') == channel]
     unused = [m for m in items if not m.get('used')]
     return jsonify({"total": len(items), "unused": len(unused), "items": items})
 
+
+
+@app.route('/library/<job_id>/discard', methods=['POST'])
+def library_discard(job_id):
+    """Remove a Short from the library, e.g. when it was rejected in Telegram."""
+    if not re.fullmatch(r'[A-Za-z0-9_\-]+', job_id):
+        return jsonify({"error": "bad id"}), 400
+    existed = os.path.exists(f"{SHORTS_DIR}/{job_id}.json")
+    safe_remove(f"{SHORTS_DIR}/{job_id}.mp4", f"{SHORTS_DIR}/{job_id}.json")
+    log.info(f"[{job_id}] removed from library")
+    return jsonify({"status": "ok", "removed": existed})
 
 # =====================================================================
 # Weekly long video from stored Shorts
@@ -806,11 +822,20 @@ def compile_video(cid):
 # Env vars on Render: YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN
 # =====================================================================
 
-def yt_access_token():
+def yt_env(name, channel=None):
+    """YT_REFRESH_TOKEN_MEDIEVAL for channel 'medieval', falling back to YT_REFRESH_TOKEN."""
+    if channel:
+        v = os.environ.get(f"{name}_{str(channel).upper()}")
+        if v:
+            return v
+    return os.environ[name]
+
+
+def yt_access_token(channel=None):
     r = requests.post('https://oauth2.googleapis.com/token', data={
-        'client_id': os.environ['YT_CLIENT_ID'],
-        'client_secret': os.environ['YT_CLIENT_SECRET'],
-        'refresh_token': os.environ['YT_REFRESH_TOKEN'],
+        'client_id': yt_env('YT_CLIENT_ID', channel),
+        'client_secret': yt_env('YT_CLIENT_SECRET', channel),
+        'refresh_token': yt_env('YT_REFRESH_TOKEN', channel),
         'grant_type': 'refresh_token',
     }, timeout=30)
     r.raise_for_status()
@@ -863,7 +888,7 @@ def compile_youtube(cid):
     }
     size = os.path.getsize(path)
     try:
-        token = yt_access_token()
+        token = yt_access_token(data.get('channel') or st.get('channel'))
         init = requests.post(
             'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
             headers={
@@ -963,7 +988,7 @@ def compile_thumbnail(cid):
         return jsonify({"error": "thumbnail render failed", "detail": str(e)}), 500
 
     try:
-        token = yt_access_token()
+        token = yt_access_token(data.get('channel') or st.get('channel'))
         with open(out, 'rb') as f:
             r = requests.post(
                 f'https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={video_id}&uploadType=media',
@@ -987,6 +1012,295 @@ def compile_thumbnail_preview(cid):
     if not re.fullmatch(r'[A-Za-z0-9_\-]+', cid) or not os.path.exists(p):
         return jsonify({"error": "no thumbnail"}), 404
     return send_file(p, mimetype='image/jpeg')
+
+
+# =====================================================================
+# Original long videos (16:9): the server generates the images and the
+# voiceover itself, so n8n only sends the script. Uses the compile
+# folders and status, so /compile/<id>, /compile/<id>/youtube and
+# /compile/<id>/thumbnail work for these jobs too.
+# Env: OPENAI_API_KEY, ELEVEN_API_KEY_LONG (or ELEVEN_API_KEY)
+# =====================================================================
+
+OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare")
+IMG_INTERVAL = float(os.environ.get("IMG_INTERVAL", "13"))   # seconds between image requests (rate limit)
+LONG_OVERSAMPLE = 1.25
+LONG_MOVE = 0.08              # gentle zoom / pan for long videos
+LONG_MUSIC_VOLUME = 0.08
+LONG_SUB_WORDS = 7            # words per subtitle line
+
+
+def http_retry(fn, tries=5, wait=20, what="request"):
+    last = None
+    for i in range(tries):
+        try:
+            r = fn()
+            if r.status_code < 300:
+                return r
+            last = f"{r.status_code} {r.text[-400:]}"
+            if r.status_code not in (408, 409, 429, 500, 502, 503, 504):
+                break
+        except requests.RequestException as e:
+            last = str(e)
+        time.sleep(wait * (i + 1))
+    raise RuntimeError(f"{what} failed: {last}")
+
+
+def gen_image(prompt, quality, out):
+    key = os.environ['OPENAI_API_KEY']
+    r = http_retry(lambda: requests.post(
+        'https://api.openai.com/v1/images/generations',
+        headers={'Authorization': f'Bearer {key}'},
+        json={'model': OPENAI_IMAGE_MODEL, 'prompt': prompt, 'size': '1536x1024',
+              'quality': quality, 'output_format': 'jpeg', 'output_compression': 85, 'n': 1},
+        timeout=240), what="image")
+    b64 = r.json()['data'][0]['b64_json']
+    with open(out + '.tmp', 'wb') as f:
+        f.write(base64.b64decode(b64))
+    os.replace(out + '.tmp', out)
+
+
+def eleven_key():
+    return os.environ.get('ELEVEN_API_KEY_LONG') or os.environ['ELEVEN_API_KEY']
+
+
+def gen_voice(text, voice_id, model_id, out_mp3, out_align):
+    r = http_retry(lambda: requests.post(
+        f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps',
+        headers={'xi-api-key': eleven_key()},
+        json={'text': text, 'model_id': model_id,
+              'voice_settings': {'stability': 0.5, 'similarity_boost': 0.75}},
+        timeout=300), what="voiceover")
+    js = r.json()
+    with open(out_mp3, 'wb') as f:
+        f.write(base64.b64decode(js['audio_base64']))
+    with open(out_align, 'w') as f:
+        json.dump(js.get('alignment') or {}, f)
+
+
+def gen_music(prompt, out_mp3, length_ms=90000):
+    r = http_retry(lambda: requests.post(
+        'https://api.elevenlabs.io/v1/music?output_format=mp3_44100_128',
+        headers={'xi-api-key': eleven_key()},
+        json={'prompt': prompt, 'music_length_ms': length_ms, 'model_id': 'music_v2',
+              'force_instrumental': True},
+        timeout=600), tries=3, what="music")
+    with open(out_mp3, 'wb') as f:
+        f.write(r.content)
+
+
+def write_long_subs(path, words):
+    """Sentence-style subtitles at the bottom of a 16:9 frame."""
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {LONG_W}
+PlayResY: {LONG_H}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Sub,{CAPTION_FONT},54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H78000000,-1,0,0,0,100,100,0,0,1,4,2,2,160,160,70,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = []
+    for i in range(0, len(words), LONG_SUB_WORDS):
+        chunk = words[i:i + LONG_SUB_WORDS]
+        text = ' '.join(ass_escape(w[0]) for w in chunk)
+        lines.append(f"Dialogue: 0,{ass_time(chunk[0][1])},{ass_time(chunk[-1][2])},Sub,,0,0,0,,{text}")
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(header + "\n".join(lines) + "\n")
+
+
+def long_motion(i, n):
+    """Alternate zoom in, zoom out, pan right, pan left."""
+    m = LONG_MOVE
+    kind = i % 4
+    if kind == 0:
+        return f"1+{m}*on/{n}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    if kind == 1:
+        return f"{1 + m}-{m}*on/{n}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    if kind == 2:
+        return f"{1 + m}", f"(iw-iw/zoom)*on/{n}", "ih/2-(ih/zoom/2)"
+    return f"{1 + m}", f"(iw-iw/zoom)*(1-on/{n})", "ih/2-(ih/zoom/2)"
+
+
+def render_long_chapter(work, ci, shot_texts, audio, alignment, out):
+    duration = get_duration(audio)
+    text = ' '.join(shot_texts)
+    times = char_times(text, alignment, duration)
+    bounds = shot_boundaries(shot_texts, times, duration)
+    ass = f"{work}/ch_{ci}.ass"
+    write_long_subs(ass, word_timings(text, times, alignment, duration))
+
+    total_frames = max(int(round(duration * FPS)), 1)
+    frames, acc = [], 0
+    for i, (s_, e_) in enumerate(bounds):
+        n = total_frames - acc if i == len(bounds) - 1 else int(round(e_ * FPS)) - acc
+        n = max(n, 1)
+        frames.append(n)
+        acc += n
+
+    bw, bh = int(LONG_W * LONG_OVERSAMPLE) // 2 * 2, int(LONG_H * LONG_OVERSAMPLE) // 2 * 2
+    inputs, chains = [], []
+    for i, n in enumerate(frames):
+        img = f"{work}/img_{ci}_{i}.jpg"
+        inputs += ['-i', img]
+        z, x, y = long_motion(i, n)
+        chains.append(
+            f"[{i}:v]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},setsar=1,"
+            f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={LONG_W}x{LONG_H}:fps={FPS},setpts=PTS-STARTPTS[v{i}]")
+    cat = ''.join(f"[v{i}]" for i in range(len(frames)))
+    chains.append(f"{cat}concat=n={len(frames)}:v=1:a=0[vc]")
+    chains.append(f"[vc]subtitles={ass}:fontsdir=/usr/share/fonts,format=yuv420p[vout]")
+    chains.append(f"[{len(frames)}:a]aformat=sample_rates=44100:channel_layouts=stereo[aout]")
+    with ffmpeg_lock:
+        run_ffmpeg(inputs + ['-i', audio, '-filter_complex', ';'.join(chains),
+                             '-map', '[vout]', '-map', '[aout]'] + encode_args(out, duration),
+                   timeout=3600)
+    return duration
+
+
+def fill_missing_images(work, chapters):
+    """A failed image borrows the nearest one of the same chapter (or the previous chapter)."""
+    last = None
+    for ci, ch in enumerate(chapters):
+        paths = [f"{work}/img_{ci}_{i}.jpg" for i in range(len(ch['shots']))]
+        have = [i for i, p in enumerate(paths) if os.path.exists(p)]
+        for i, p in enumerate(paths):
+            if os.path.exists(p):
+                continue
+            src = paths[min(have, key=lambda h: (abs(h - i), h > i))] if have else last
+            if not src:
+                raise RuntimeError(f"no images at all for chapter {ci}")
+            shutil.copyfile(src, p)
+        last = paths[-1]
+
+
+def run_long(cid, payload):
+    work = f"{COMPILES_DIR}/{cid}"
+    try:
+        chapters = payload['chapters']
+        style = str(payload.get('style') or '').strip()
+        q_first = payload.get('image_quality_first') or 'medium'
+        q_rest = payload.get('image_quality') or 'low'
+        n_img = sum(len(c['shots']) for c in chapters)
+
+        # 1. images (skips files that already exist, so a retry continues where it stopped)
+        done = 0
+        for ci, ch in enumerate(chapters):
+            for si, sh in enumerate(ch['shots']):
+                p = f"{work}/img_{ci}_{si}.jpg"
+                if not os.path.exists(p):
+                    prompt = '. '.join(x for x in [style, str(sh.get('image_prompt') or sh.get('text'))] if x)
+                    try:
+                        gen_image(prompt, q_first if ci == 0 else q_rest, p)
+                    except Exception as e:
+                        log.error(f"[{cid}] image {ci}/{si} failed: {e}")
+                    time.sleep(IMG_INTERVAL)
+                done += 1
+                set_status(cid, status='running', progress=f"images {done}/{n_img}")
+        fill_missing_images(work, chapters)
+
+        # 2. voiceover per chapter
+        voice = payload['voice_id']
+        model = payload.get('voice_model') or 'eleven_multilingual_v2'
+        for ci, ch in enumerate(chapters):
+            mp3, al = f"{work}/voice_{ci}.mp3", f"{work}/voice_{ci}.json"
+            if not os.path.exists(mp3):
+                text = ' '.join(str(s['text']).strip() for s in ch['shots'])
+                gen_voice(text, voice, model, mp3, al)
+            set_status(cid, progress=f"voice {ci + 1}/{len(chapters)}")
+
+        # 3. music (optional)
+        music = f"{work}/music.mp3"
+        if payload.get('music_prompt') and not os.path.exists(music):
+            try:
+                gen_music(payload['music_prompt'], music)
+            except Exception as e:
+                log.error(f"[{cid}] music failed, continuing without: {e}")
+
+        # 4. render chapters
+        segments, chapters_out, t = [], [], 0.0
+        for ci, ch in enumerate(chapters):
+            out = f"{work}/chapter_{ci}.mp4"
+            texts = [str(s['text']).strip() for s in ch['shots']]
+            with open(f"{work}/voice_{ci}.json") as f:
+                al = json.load(f)
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                d = get_duration(out)
+            else:
+                d = render_long_chapter(work, ci, texts, f"{work}/voice_{ci}.mp3", al, out + '.tmp.mp4')
+                os.replace(out + '.tmp.mp4', out)
+            segments.append(out)
+            chapters_out.append({"title": ch.get('title') or f"Part {ci + 1}", "start": round(t, 2)})
+            t += d
+            set_status(cid, progress=f"render {ci + 1}/{len(chapters)}")
+
+        # 5. join, add music
+        concat_list = f"{work}/concat.txt"
+        with open(concat_list, 'w') as f:
+            for sgm in segments:
+                f.write(f"file '{sgm}'\n")
+        joined, final = f"{work}/joined.mp4", f"{work}/long.mp4"
+        with ffmpeg_lock:
+            run_ffmpeg(['-f', 'concat', '-safe', '0', '-i', concat_list, '-c', 'copy', joined], timeout=1800)
+            if os.path.exists(music) and os.path.getsize(music) > 1000:
+                dur = get_duration(joined)
+                try:
+                    run_ffmpeg([
+                        '-i', joined, '-stream_loop', '-1', '-i', music,
+                        '-filter_complex',
+                        f"[1:a]aformat=sample_rates=44100:channel_layouts=stereo,volume={LONG_MUSIC_VOLUME},"
+                        f"afade=t=in:st=0:d=2,afade=t=out:st={max(dur - 3, 0):.2f}:d=3[m];"
+                        f"[0:a][m]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]",
+                        '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                        '-t', f"{dur:.3f}", '-movflags', '+faststart', final], timeout=1800)
+                except FFmpegError as e:
+                    log.error(f"[{cid}] music mix failed: {e}")
+                    os.replace(joined, final)
+            else:
+                os.replace(joined, final)
+
+        for p in glob.glob(f"{work}/ch_*.ass"):
+            safe_remove(p)
+        set_status(cid, status='done', progress='done', chapters=chapters_out,
+                   duration=round(get_duration(final), 2),
+                   size_mb=round(os.path.getsize(final) / 1e6, 1))
+        log.info(f"[{cid}] long video done: {t:.0f}s, {len(chapters)} chapters")
+    except Exception as e:
+        log.error(f"[{cid}] long video failed: {e}")
+        set_status(cid, status='failed', error=str(e)[-1500:])
+
+
+@app.route('/long/start', methods=['POST'])
+def long_start():
+    """Body: job_id, channel, voice_id, voice_model, style, music_prompt,
+    image_quality_first, image_quality, chapters [{title, shots [{text, image_prompt}]}].
+    Returns at once; poll GET /compile/<job_id>. Re-posting the same job_id resumes it."""
+    payload = request.get_json(force=True)
+    cid = str(payload.get('job_id') or '')
+    if not re.fullmatch(r'[A-Za-z0-9_\-]+', cid):
+        return jsonify({"error": "bad job_id"}), 400
+    chapters = payload.get('chapters') or []
+    if not chapters or not all(c.get('shots') for c in chapters):
+        return jsonify({"error": "chapters with shots are required"}), 400
+    if not payload.get('voice_id'):
+        return jsonify({"error": "voice_id is required"}), 400
+    with compile_lock:
+        st = COMPILES.get(cid) or {}
+        if st.get('status') in ('running', 'done'):
+            return jsonify(st), 202
+        running = [c for c, s in COMPILES.items() if s.get('status') == 'running']
+        if running:
+            return jsonify({"error": "another job is running", "running": running}), 409
+        os.makedirs(f"{COMPILES_DIR}/{cid}", exist_ok=True)
+        set_status(cid, status='running', kind='long', channel=payload.get('channel'),
+                   progress='starting', error=None)
+        threading.Thread(target=run_long, args=(cid, payload), daemon=True).start()
+    return jsonify(COMPILES[cid]), 202
 
 
 if __name__ == '__main__':
