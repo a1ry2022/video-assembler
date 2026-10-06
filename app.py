@@ -1024,8 +1024,8 @@ def compile_thumbnail_preview(cid):
 
 OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare")
 IMG_INTERVAL = float(os.environ.get("IMG_INTERVAL", "13"))   # seconds between image requests (rate limit)
-LONG_OVERSAMPLE = 1.25
-LONG_MOVE = 0.08              # gentle zoom / pan for long videos
+LONG_OVERSAMPLE = 4          # big canvas so slow zoom/pan moves in sub-pixel steps (no stair-step shake)
+LONG_MOVE = 0                 # camera motion for long videos: 0 = still images, 0.08 = gentle zoom/pan
 LONG_MUSIC_VOLUME = 0.08
 LONG_SUB_WORDS = 7            # words per subtitle line
 
@@ -1143,23 +1143,43 @@ def render_long_chapter(work, ci, shot_texts, audio, alignment, out):
         frames.append(n)
         acc += n
 
+    # Each shot is rendered on its own: a 4x canvas per image is big, so doing them
+    # one at a time keeps memory low. Then the shots are joined and the voice and
+    # subtitles are added in one final pass.
     bw, bh = int(LONG_W * LONG_OVERSAMPLE) // 2 * 2, int(LONG_H * LONG_OVERSAMPLE) // 2 * 2
-    inputs, chains = [], []
-    for i, n in enumerate(frames):
-        img = f"{work}/img_{ci}_{i}.jpg"
-        inputs += ['-i', img]
-        z, x, y = long_motion(i, n)
-        chains.append(
-            f"[{i}:v]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},setsar=1,"
-            f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={LONG_W}x{LONG_H}:fps={FPS},setpts=PTS-STARTPTS[v{i}]")
-    cat = ''.join(f"[v{i}]" for i in range(len(frames)))
-    chains.append(f"{cat}concat=n={len(frames)}:v=1:a=0[vc]")
-    chains.append(f"[vc]subtitles={ass}:fontsdir=/usr/share/fonts,format=yuv420p[vout]")
-    chains.append(f"[{len(frames)}:a]aformat=sample_rates=44100:channel_layouts=stereo[aout]")
+    shot_files = []
     with ffmpeg_lock:
-        run_ffmpeg(inputs + ['-i', audio, '-filter_complex', ';'.join(chains),
-                             '-map', '[vout]', '-map', '[aout]'] + encode_args(out, duration),
+        for i, n in enumerate(frames):
+            img = f"{work}/img_{ci}_{i}.jpg"
+            z, x, y = long_motion(i, n)
+            sf = f"{work}/shot_{ci}_{i}.mp4"
+            if LONG_MOVE > 0:
+                vf = (f"scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},setsar=1,"
+                      f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={LONG_W}x{LONG_H}:fps={FPS},format=yuv420p")
+            else:   # still image, no motion at all
+                vf = (f"scale={LONG_W}:{LONG_H}:force_original_aspect_ratio=increase:flags=lanczos,"
+                      f"crop={LONG_W}:{LONG_H},setsar=1,fps={FPS},format=yuv420p")
+            run_ffmpeg([
+                '-loop', '1', '-framerate', str(FPS), '-i', img,
+                '-vf', vf,
+                '-frames:v', str(n), '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17',
+                '-threads', '2', sf], timeout=900)
+            shot_files.append(sf)
+
+        lst = f"{work}/shots_{ci}.txt"
+        with open(lst, 'w') as f:
+            for sf in shot_files:
+                f.write(f"file '{sf}'\n")
+        silent = f"{work}/silent_{ci}.mp4"
+        run_ffmpeg(['-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', silent], timeout=600)
+
+        run_ffmpeg(['-i', silent, '-i', audio,
+                    '-filter_complex',
+                    f"[0:v]subtitles={ass}:fontsdir=/usr/share/fonts,format=yuv420p[vout];"
+                    f"[1:a]aformat=sample_rates=44100:channel_layouts=stereo[aout]",
+                    '-map', '[vout]', '-map', '[aout]'] + encode_args(out, duration),
                    timeout=3600)
+    safe_remove(silent, lst, *shot_files)
     return duration
 
 
