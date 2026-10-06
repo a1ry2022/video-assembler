@@ -1025,7 +1025,7 @@ def compile_thumbnail_preview(cid):
 OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare")
 IMG_INTERVAL = float(os.environ.get("IMG_INTERVAL", "13"))   # seconds between image requests (rate limit)
 LONG_OVERSAMPLE = 4          # big canvas so slow zoom/pan moves in sub-pixel steps (no stair-step shake)
-LONG_MOVE = 0                 # camera motion for long videos: 0 = still images, 0.08 = gentle zoom/pan
+LONG_MOVE = 0.06              # slow zoom for long videos (0 = still images)
 LONG_MUSIC_VOLUME = 0.08
 LONG_SUB_WORDS = 7            # words per subtitle line
 
@@ -1127,6 +1127,38 @@ def long_motion(i, n):
     return f"{1 + m}", f"(iw-iw/zoom)*(1-on/{n})", "ih/2-(ih/zoom/2)"
 
 
+
+def render_zoom_shot(img_path, n, out, zoom_in=True):
+    """Perfectly smooth zoom: every frame is resampled from the source image with
+    sub-pixel precision (Pillow), so there is no stair-step shake like zoompan."""
+    from PIL import Image
+    im = Image.open(img_path).convert('RGB')
+    sw, sh = im.size
+    base = max(LONG_W / sw, LONG_H / sh)       # cover the 16:9 frame
+    cx, cy = sw / 2, sh / 2
+    p = subprocess.Popen(
+        ['ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+         '-s', f'{LONG_W}x{LONG_H}', '-r', str(FPS), '-i', '-',
+         '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17',
+         '-pix_fmt', 'yuv420p', '-threads', '2', out],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for k in range(n):
+            t = k / max(n - 1, 1)
+            z = 1 + LONG_MOVE * (t if zoom_in else 1 - t)
+            a = 1 / (base * z)
+            fr = im.transform((LONG_W, LONG_H), Image.AFFINE,
+                              (a, 0, cx - LONG_W / 2 * a, 0, a, cy - LONG_H / 2 * a),
+                              resample=Image.BILINEAR)
+            p.stdin.write(fr.tobytes())
+        p.stdin.close()
+        err = p.stderr.read().decode(errors='ignore')
+        if p.wait(timeout=600) != 0:
+            raise FFmpegError(err[-1500:])
+    except BrokenPipeError:
+        raise FFmpegError(p.stderr.read().decode(errors='ignore')[-1500:])
+
+
 def render_long_chapter(work, ci, shot_texts, audio, alignment, out):
     duration = get_duration(audio)
     text = ' '.join(shot_texts)
@@ -1151,19 +1183,16 @@ def render_long_chapter(work, ci, shot_texts, audio, alignment, out):
     with ffmpeg_lock:
         for i, n in enumerate(frames):
             img = f"{work}/img_{ci}_{i}.jpg"
-            z, x, y = long_motion(i, n)
             sf = f"{work}/shot_{ci}_{i}.mp4"
             if LONG_MOVE > 0:
-                vf = (f"scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},setsar=1,"
-                      f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={LONG_W}x{LONG_H}:fps={FPS},format=yuv420p")
+                render_zoom_shot(img, n, sf, zoom_in=(i % 2 == 0))
             else:   # still image, no motion at all
-                vf = (f"scale={LONG_W}:{LONG_H}:force_original_aspect_ratio=increase:flags=lanczos,"
-                      f"crop={LONG_W}:{LONG_H},setsar=1,fps={FPS},format=yuv420p")
-            run_ffmpeg([
-                '-loop', '1', '-framerate', str(FPS), '-i', img,
-                '-vf', vf,
-                '-frames:v', str(n), '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17',
-                '-threads', '2', sf], timeout=900)
+                run_ffmpeg([
+                    '-loop', '1', '-framerate', str(FPS), '-i', img,
+                    '-vf', f"scale={LONG_W}:{LONG_H}:force_original_aspect_ratio=increase:flags=lanczos,"
+                           f"crop={LONG_W}:{LONG_H},setsar=1,fps={FPS},format=yuv420p",
+                    '-frames:v', str(n), '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17',
+                    '-threads', '2', sf], timeout=900)
             shot_files.append(sf)
 
         lst = f"{work}/shots_{ci}.txt"
