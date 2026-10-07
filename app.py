@@ -824,10 +824,13 @@ def compile_video(cid):
 
 def yt_env(name, channel=None):
     """YT_REFRESH_TOKEN_MEDIEVAL for channel 'medieval', falling back to YT_REFRESH_TOKEN."""
-    if channel:
-        v = os.environ.get(f"{name}_{str(channel).upper()}")
-        if v:
-            return v
+    if channel and str(channel).lower() != 'cosmic':
+        key = f"{name}_{str(channel).upper()}"
+        v = os.environ.get(key)
+        if not v:
+            # never fall back to another channel's account: that uploads to the wrong channel
+            raise RuntimeError(f"{key} is not set on the server")
+        return v
     return os.environ[name]
 
 
@@ -1322,6 +1325,62 @@ def run_long(cid, payload):
     except Exception as e:
         log.error(f"[{cid}] long video failed: {e}")
         set_status(cid, status='failed', error=str(e)[-1500:])
+
+
+def build_long_srt(work):
+    """English .srt for a finished long video, built from the ElevenLabs timings of each chapter."""
+    with open(f"{work}/status.json") as f:
+        st = json.load(f)
+
+    def ts(t):
+        ms = int(round(max(t, 0) * 1000))
+        return f"{ms // 3600000:02}:{ms // 60000 % 60:02}:{ms // 1000 % 60:02},{ms % 1000:03}"
+
+    out, n = [], 0
+    for ci, ch in enumerate(st.get('chapters') or []):
+        ap = f"{work}/voice_{ci}.json"
+        if not os.path.exists(ap):
+            continue
+        with open(ap) as f:
+            al = json.load(f)
+        off = float(ch.get('start') or 0)
+        words, cur, ws, we = [], '', 0.0, 0.0
+        for c, a, b in zip(al.get('characters') or [], al.get('character_start_times_seconds') or [],
+                           al.get('character_end_times_seconds') or []):
+            if c.isspace():
+                if cur:
+                    words.append((cur, ws, we))
+                    cur = ''
+            else:
+                if not cur:
+                    ws = a
+                cur += c
+                we = b
+        if cur:
+            words.append((cur, ws, we))
+        line = []
+        for i, wd in enumerate(words):
+            line.append(wd)
+            last = wd[0][-1]
+            if len(line) >= 10 or (len(line) >= 4 and last in '.!?,;:') or last in '.!?' or i == len(words) - 1:
+                n += 1
+                out.append(f"{n}\n{ts(off + line[0][1])} --> {ts(off + line[-1][2])}\n{' '.join(x[0] for x in line)}\n")
+                line = []
+    return '\n'.join(out)
+
+
+@app.route('/compile/<cid>/subtitles.srt', methods=['GET'])
+def compile_srt(cid):
+    if not re.fullmatch(r'[A-Za-z0-9_\-]+', cid):
+        return jsonify({"error": "bad compile_id"}), 400
+    work = f"{COMPILES_DIR}/{cid}"
+    if not os.path.exists(f"{work}/status.json"):
+        return jsonify({"error": "unknown compile_id"}), 404
+    srt = build_long_srt(work)
+    if not srt:
+        return jsonify({"error": "no timings found for this video"}), 404
+    return srt, 200, {'Content-Type': 'application/x-subrip; charset=utf-8',
+                      'Content-Disposition': f'attachment; filename="{cid}.srt"'}
 
 
 @app.route('/long/start', methods=['POST'])
