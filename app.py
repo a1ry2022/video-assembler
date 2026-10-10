@@ -1327,6 +1327,83 @@ def run_long(cid, payload):
         set_status(cid, status='failed', error=str(e)[-1500:])
 
 
+# ---------- Topic ideas queue (filled weekly by the Competitor Radar workflow) ----------
+IDEAS_DIR = f"{DATA_DIR}/ideas"
+IDEA_KINDS = ('short', 'long')
+IDEA_QUEUE_MAX = 60
+IDEA_DONE_MAX = 300
+ideas_lock = threading.Lock()
+
+
+def _ideas_file(channel, kind):
+    return f"{IDEAS_DIR}/{channel}_{kind}.json"
+
+
+def _ideas_load(channel, kind):
+    try:
+        with open(_ideas_file(channel, kind)) as f:
+            d = json.load(f)
+        return {"queue": list(d.get("queue") or []), "done": list(d.get("done") or [])}
+    except Exception:
+        return {"queue": [], "done": []}
+
+
+def _ideas_save(channel, kind, d):
+    os.makedirs(IDEAS_DIR, exist_ok=True)
+    tmp = _ideas_file(channel, kind) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, _ideas_file(channel, kind))
+
+
+@app.route('/ideas/<channel>', methods=['GET', 'POST'])
+def ideas(channel):
+    if not re.fullmatch(r'[a-z0-9_\-]{1,30}', channel):
+        return jsonify({"error": "bad channel"}), 400
+    if request.method == 'GET':
+        return jsonify({k: _ideas_load(channel, k)["queue"] for k in IDEA_KINDS})
+    body = request.get_json(silent=True) or {}
+    kind = body.get('kind')
+    if kind not in IDEA_KINDS:
+        return jsonify({"error": "kind must be short or long"}), 400
+    fresh = []
+    for x in body.get('ideas') or []:
+        if isinstance(x, dict) and isinstance(x.get('topic'), str) and len(x['topic'].strip()) >= 20:
+            fresh.append({
+                "topic": x['topic'].strip()[:400],
+                "format": str(x.get('format') or '')[:20],
+                "why": str(x.get('why') or '')[:300],
+            })
+    with ideas_lock:
+        d = _ideas_load(channel, kind)
+        seen = {t.lower() for t in d["done"]} | {q["topic"].lower() for q in d["queue"]}
+        added = 0
+        for n in fresh:
+            if n["topic"].lower() not in seen:
+                d["queue"].append(n)
+                seen.add(n["topic"].lower())
+                added += 1
+        d["queue"] = d["queue"][-IDEA_QUEUE_MAX:]
+        _ideas_save(channel, kind, d)
+    return jsonify({"ok": True, "added": added, "queued": len(d["queue"])})
+
+
+@app.route('/ideas/<channel>/next', methods=['POST'])
+def ideas_next(channel):
+    if not re.fullmatch(r'[a-z0-9_\-]{1,30}', channel):
+        return jsonify({"error": "bad channel"}), 400
+    kind = request.args.get('kind')
+    if kind not in IDEA_KINDS:
+        return jsonify({"error": "kind must be short or long"}), 400
+    with ideas_lock:
+        d = _ideas_load(channel, kind)
+        idea = d["queue"].pop(0) if d["queue"] else None
+        if idea:
+            d["done"] = (d["done"] + [idea["topic"]])[-IDEA_DONE_MAX:]
+            _ideas_save(channel, kind, d)
+    return jsonify({"idea": idea, "left": len(d["queue"])})
+
+
 def build_long_srt(work):
     """English .srt for a finished long video, built from the ElevenLabs timings of each chapter."""
     with open(f"{work}/status.json") as f:
