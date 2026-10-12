@@ -1327,6 +1327,37 @@ def run_long(cid, payload):
         set_status(cid, status='failed', error=str(e)[-1500:])
 
 
+# ---------- Publish / unpublish a video from the Telegram control bot ----------
+@app.route('/youtube/<channel>/publish', methods=['POST'])
+def youtube_publish(channel):
+    if not re.fullmatch(r'[a-z0-9_\-]{1,30}', channel):
+        return jsonify({"error": "bad channel"}), 400
+    body = request.get_json(silent=True) or {}
+    vid = str(body.get('video_id') or '')
+    privacy = body.get('privacy') or 'public'
+    if not re.fullmatch(r'[A-Za-z0-9_\-]{11}', vid) or privacy not in ('public', 'unlisted', 'private'):
+        return jsonify({"error": "bad video_id or privacy"}), 400
+    try:
+        token = yt_access_token(channel)
+    except Exception as e:
+        return jsonify({"error": f"no access for channel: {e}"}), 500
+    h = {'Authorization': 'Bearer ' + token}
+    r = requests.get('https://www.googleapis.com/youtube/v3/videos',
+                     params={'part': 'status', 'id': vid}, headers=h, timeout=30)
+    items = (r.json().get('items') or []) if r.ok else []
+    if not items:
+        return jsonify({"error": "video not found on this channel", "detail": r.text[:300]}), 404
+    old = items[0].get('status') or {}
+    # send back only the editable fields, otherwise YouTube resets the ones we leave out
+    status = {k: old[k] for k in ('embeddable', 'license', 'publicStatsViewable', 'selfDeclaredMadeForKids') if k in old}
+    status['privacyStatus'] = privacy
+    u = requests.put('https://www.googleapis.com/youtube/v3/videos', params={'part': 'status'},
+                     headers=h, json={'id': vid, 'status': status}, timeout=30)
+    if not u.ok:
+        return jsonify({"error": "youtube refused", "detail": u.text[:300]}), 502
+    return jsonify({"ok": True, "video_id": vid, "privacy": privacy})
+
+
 # ---------- Topic ideas queue (filled weekly by the Competitor Radar workflow) ----------
 IDEAS_DIR = f"{DATA_DIR}/ideas"
 IDEA_KINDS = ('short', 'long')
@@ -1374,16 +1405,23 @@ def ideas(channel):
                 "format": str(x.get('format') or '')[:20],
                 "why": str(x.get('why') or '')[:300],
             })
+    front = bool(body.get('front'))   # topics typed by the owner jump the queue and ignore the "already used" list
     with ideas_lock:
         d = _ideas_load(channel, kind)
-        seen = {t.lower() for t in d["done"]} | {q["topic"].lower() for q in d["queue"]}
-        added = 0
+        seen = {q["topic"].lower() for q in d["queue"]}
+        if not front:
+            seen |= {t.lower() for t in d["done"]}
+        added, take = 0, []
         for n in fresh:
             if n["topic"].lower() not in seen:
-                d["queue"].append(n)
+                take.append(n)
                 seen.add(n["topic"].lower())
                 added += 1
-        d["queue"] = d["queue"][-IDEA_QUEUE_MAX:]
+        if front:
+            d["queue"] = take + d["queue"]
+            d["queue"] = d["queue"][:IDEA_QUEUE_MAX]
+        else:
+            d["queue"] = (d["queue"] + take)[-IDEA_QUEUE_MAX:]
         _ideas_save(channel, kind, d)
     return jsonify({"ok": True, "added": added, "queued": len(d["queue"])})
 
