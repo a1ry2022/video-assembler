@@ -34,7 +34,10 @@ CAPTION_FONT = "DejaVu Sans"
 CAPTION_SIZE = 78
 CAPTION_OUTLINE = 6
 CAPTION_MARGIN_V = 330      # distance from bottom edge, px
+CAPTION_SIDE_MARGIN = 40    # left and right margin, px
+CAPTION_MIN_SIZE = 34       # long words are shrunk to fit the frame, but not below this
 CAPTION_UPPERCASE = True
+CAPTION_FONT_FILE = os.environ.get("CAPTION_FONT_FILE", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "/app/music")
 MUSIC_VOLUME = 0.12
@@ -248,9 +251,37 @@ def word_timings(scene_text, times, alignment, duration):
     return words
 
 
+_font_cache = {}
+
+
+def text_width(text, size):
+    """Width in caption-canvas px of `text` in DejaVu Sans Bold at ASS font size `size`.
+    libass treats the size as the line height (about 1.164 em for DejaVu), so the real
+    em size is size / 1.164."""
+    em = size / 1.164
+    try:
+        if 'f' not in _font_cache:
+            from PIL import ImageFont
+            _font_cache['f'] = ImageFont.truetype(CAPTION_FONT_FILE, 100)
+        return _font_cache['f'].getlength(text) * em / 100
+    except Exception:
+        return len(text) * 0.80 * em       # rough estimate for capital letters
+
+
+def fit_caption_size(text, pop_scale):
+    """Largest font size (up to CAPTION_SIZE) at which the word fits between the side margins,
+    also at the start of the pop animation. Long German compounds need this."""
+    avail = CAPTION_CANVAS_W - 2 * CAPTION_SIDE_MARGIN - 2 * CAPTION_OUTLINE
+    w = text_width(text, CAPTION_SIZE) * pop_scale
+    if w <= avail:
+        return CAPTION_SIZE
+    size = int(CAPTION_SIZE * avail / w)
+    return max(size, CAPTION_MIN_SIZE)
+
+
 def write_ass(path, words, highlight=None):
     style = (f"Style: Word,{CAPTION_FONT},{CAPTION_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,"
-             f"-1,0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},2,2,40,40,{CAPTION_MARGIN_V},1")
+             f"-1,0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},2,2,{CAPTION_SIDE_MARGIN},{CAPTION_SIDE_MARGIN},{CAPTION_MARGIN_V},1")
     norm = lambda w: re.sub(r'[^\w%$#]+', '', str(w)).lower()
     hl = {norm(w) for w in (highlight or []) if norm(w)}
     events = []
@@ -258,9 +289,13 @@ def write_ass(path, words, highlight=None):
         text = word.upper() if CAPTION_UPPERCASE else word
         text = text.replace('{', '').replace('}', '')
         if norm(word) in hl:
+            size = fit_caption_size(text, 1.30)
             pop = r"{\c" + HIGHLIGHT_COLOR + r"&\fscx130\fscy130\t(0,110,\fscx108\fscy108)}"
         else:
+            size = fit_caption_size(text, 1.18)
             pop = r"{\fscx118\fscy118\t(0,90,\fscx100\fscy100)}"
+        if size < CAPTION_SIZE:
+            pop = pop[:-1] + r"\fs" + str(size) + "}"
         events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Word,,0,0,0,,{pop}{text}")
     with open(path, 'w', encoding='utf-8') as f:
         f.write(ass_doc(CAPTION_CANVAS_W, CAPTION_CANVAS_H, [style], events, wrap=2))
