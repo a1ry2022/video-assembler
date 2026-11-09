@@ -1003,7 +1003,14 @@ def cleanup_job(cid):
 #   other channels:    YT_CLIENT_ID_<CHANNEL>, YT_CLIENT_SECRET_<CHANNEL>, YT_REFRESH_TOKEN_<CHANNEL>
 # =====================================================================
 
+# The German channel is the former Cosmic Unknown channel: same Google account, so it uses the
+# default (unsuffixed) YT_* variables. Add other aliases here if a channel shares an account.
+CHANNEL_ALIASES = {'german': 'cosmic'}
+
+
 def yt_env(name, channel=None):
+    if channel:
+        channel = CHANNEL_ALIASES.get(str(channel).lower(), channel)
     if channel and str(channel).lower() != 'cosmic':
         key = f"{name}_{str(channel).upper()}"
         v = os.environ.get(key)
