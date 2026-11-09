@@ -1240,6 +1240,29 @@ def http_retry(fn, tries=5, wait=20, what="request"):
     raise RuntimeError(f"{what} failed: {last}")
 
 
+@app.route('/preflight', methods=['GET'])
+def preflight():
+    """Can the long-video ElevenLabs account pay for a voiceover right now? Used by the Telegram bot."""
+    try:
+        r = requests.get('https://api.elevenlabs.io/v1/user/subscription',
+                         headers={'xi-api-key': eleven_key()}, timeout=20)
+    except KeyError:
+        return jsonify({"elevenlabs": "no key"})
+    except requests.RequestException:
+        return jsonify({"elevenlabs": "unreachable"})
+    if r.status_code in (401, 402):
+        return jsonify({"elevenlabs": "refused", "status": "payment problem or wrong key"})
+    try:
+        js = r.json()
+    except ValueError:
+        return jsonify({"elevenlabs": "unreachable"})
+    limit = js.get('character_limit') or 0
+    left = limit - (js.get('character_count') or 0)
+    ok = js.get('status') not in BAD_SUBSCRIPTION and (not limit or left > 0)
+    return jsonify({"elevenlabs": "ok" if ok else "problem", "status": js.get('status'),
+                    "characters_left": left, "limit": limit})
+
+
 def gen_image(prompt, quality, out):
     key = os.environ['OPENAI_API_KEY']
     r = http_retry(lambda: requests.post(
@@ -1625,6 +1648,26 @@ def ideas(channel):
             d["queue"] = (d["queue"] + take)[-IDEA_QUEUE_MAX:]
         _ideas_save(channel, kind, d)
     return jsonify({"ok": True, "added": len(take), "queued": len(d["queue"])})
+
+
+@app.route('/ideas/<channel>/remove', methods=['POST'])
+def ideas_remove(channel):
+    """Body: kind (short|long), topic. Removes the exact topic (case-insensitive) from the queue."""
+    if not CHANNEL_RE.fullmatch(channel):
+        return jsonify({"error": "bad channel"}), 400
+    body = request.get_json(silent=True) or {}
+    kind = body.get('kind')
+    topic = str(body.get('topic') or '').strip().lower()
+    if kind not in IDEA_KINDS or not topic:
+        return jsonify({"error": "kind and topic are required"}), 400
+    with ideas_lock:
+        d = _ideas_load(channel, kind)
+        keep = [q for q in d["queue"] if q["topic"].strip().lower() != topic]
+        removed = len(d["queue"]) - len(keep)
+        if removed:
+            d["queue"] = keep
+            _ideas_save(channel, kind, d)
+    return jsonify({"ok": True, "removed": removed > 0, "left": len(d["queue"])})
 
 
 @app.route('/ideas/<channel>/next', methods=['POST'])
