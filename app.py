@@ -1251,6 +1251,36 @@ def eleven_key():
     return os.environ.get('ELEVEN_API_KEY_LONG') or os.environ['ELEVEN_API_KEY']
 
 
+BAD_SUBSCRIPTION = ('past_due', 'unpaid', 'incomplete', 'incomplete_expired', 'canceled')
+
+
+def eleven_preflight(chapters):
+    """Check the ElevenLabs account BEFORE any image is paid for. Returns None when all is fine,
+    otherwise (json, http_code). A failed check on our side (timeout, no key) does not block."""
+    need = sum(len(str(s.get('text') or '')) + 1 for c in chapters for s in c.get('shots', []))
+    try:
+        r = requests.get('https://api.elevenlabs.io/v1/user/subscription',
+                         headers={'xi-api-key': eleven_key()}, timeout=20)
+    except (requests.RequestException, KeyError):
+        return None
+    if r.status_code in (401, 402):
+        return {"error": "elevenlabs refused the key: unpaid invoice or wrong key",
+                "detail": r.text[-300:]}, 402
+    if r.status_code >= 300:
+        return None
+    try:
+        js = r.json()
+    except ValueError:
+        return None
+    if js.get('status') in BAD_SUBSCRIPTION:
+        return {"error": f"elevenlabs subscription is {js.get('status')}: pay the invoice first"}, 402
+    left = (js.get('character_limit') or 0) - (js.get('character_count') or 0)
+    if js.get('character_limit') and left < need:
+        return {"error": "not enough elevenlabs characters for this script",
+                "need": need, "left": left}, 402
+    return None
+
+
 def gen_voice(text, voice_id, model_id, out_mp3, out_align):
     r = http_retry(lambda: requests.post(
         f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps',
@@ -1495,6 +1525,14 @@ def long_start():
         return jsonify({"error": "chapters with shots are required"}), 400
     if not payload.get('voice_id'):
         return jsonify({"error": "voice_id is required"}), 400
+
+    # fail before the images are generated if the voice cannot be paid for (see eleven_preflight)
+    already = (COMPILES.get(cid) or {}).get('status') in ('running', 'done')
+    if not already:
+        bad = eleven_preflight(chapters)
+        if bad:
+            log.error(f"[{cid}] preflight: {bad[0]}")
+            return jsonify(bad[0]), bad[1]
 
     with compile_lock:
         st = COMPILES.get(cid) or {}
