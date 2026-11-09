@@ -388,6 +388,7 @@ def disk():
         "free_gb": round(usage.free / 1024 ** 3, 2),
         "total_gb": round(usage.total / 1024 ** 3, 2),
         "shorts_mb": round(dir_size(SHORTS_DIR) / 1048576) if os.path.isdir(SHORTS_DIR) else 0,
+        "tmp_jobs_mb": round(dir_size(JOBS_ROOT) / 1048576) if os.path.isdir(JOBS_ROOT) else 0,
         "compiles": folders[:20],
         "running": running_jobs(),
     })
@@ -670,12 +671,11 @@ def finalize():
     except Exception as e:
         log.error(f"[{job_id}] library save failed: {e}")
 
-    response = send_file(output, mimetype='video/mp4')
-
-    @response.call_on_close
-    def cleanup():
-        shutil.rmtree(work_dir, ignore_errors=True)
-
+    # call_on_close does not fire for send_file responses, so the folder was never removed.
+    # Open the file first, delete the folder (the open handle keeps the data readable on Linux), then send.
+    fh = open(output, 'rb')
+    response = send_file(fh, mimetype='video/mp4')
+    shutil.rmtree(work_dir, ignore_errors=True)
     return response
 
 
@@ -718,7 +718,7 @@ def library_cleanup():
     cutoff = time.time() - LIBRARY_KEEP_DAYS * 86400
     for m in library_items():
         if m.get('created', 0) < cutoff:
-            safe_remove(f"{SHORTS_DIR}/{m['id']}.mp4", f"{SHORTS_DIR}/{m['id']}.json")
+            safe_remove(f"{SHORTS_DIR}/{m['id']}.mp4", f"{SHORTS_DIR}/{m['id']}.json", f"{SHORTS_DIR}/{m['id']}.share.mp4")
 
 
 @app.route('/library', methods=['GET'])
@@ -738,9 +738,37 @@ def library_discard(job_id):
     if not valid_id(job_id):
         return jsonify({"error": "bad id"}), 400
     existed = os.path.exists(f"{SHORTS_DIR}/{job_id}.json")
-    safe_remove(f"{SHORTS_DIR}/{job_id}.mp4", f"{SHORTS_DIR}/{job_id}.json")
+    safe_remove(f"{SHORTS_DIR}/{job_id}.mp4", f"{SHORTS_DIR}/{job_id}.json", f"{SHORTS_DIR}/{job_id}.share.mp4")
     log.info(f"[{job_id}] removed from library")
     return jsonify({"status": "ok", "removed": existed})
+
+
+@app.route('/library/<job_id>/share.mp4', methods=['GET'])
+def library_share(job_id):
+    """A lighter copy of a stored Short for sending to Telegram (the bot limit is 50 MB, the
+    original is 40-50 MB). Built on demand, sent, then deleted."""
+    if not valid_id(job_id):
+        return jsonify({"error": "bad id"}), 400
+    src = f"{SHORTS_DIR}/{job_id}.mp4"
+    if not os.path.exists(src):
+        return jsonify({"error": "not in the library"}), 404
+    dst = f"{SHORTS_DIR}/{job_id}.share.mp4"
+    tmp = f"{SHORTS_DIR}/{job_id}.share.tmp.mp4"
+    try:
+        with ffmpeg_lock:
+            run_ffmpeg(['-i', src, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27',
+                        '-maxrate', '3500k', '-bufsize', '7000k', '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', tmp], timeout=300)
+        os.replace(tmp, dst)
+    except subprocess.TimeoutExpired:
+        safe_remove(tmp)
+        return jsonify({"error": "ffmpeg timeout"}), 504
+    except FFmpegError as e:
+        safe_remove(tmp)
+        return jsonify({"error": "ffmpeg failed", "detail": str(e)[-500:]}), 500
+    fh = open(dst, 'rb')
+    safe_remove(dst)                      # the open handle keeps the data readable while it is sent
+    return send_file(fh, mimetype='video/mp4')
 
 
 # =====================================================================
