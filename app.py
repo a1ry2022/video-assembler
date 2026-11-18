@@ -1315,14 +1315,37 @@ def preflight():
                     "characters_left": left, "limit": limit})
 
 
+def openai_keys():
+    keys = [os.environ.get(n) for n in ('OPENAI_API_KEY2', 'OPENAI_API_KEY')]
+    seen, out = set(), []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    if not out:
+        raise KeyError('OPENAI_API_KEY')
+    return out
+
+
 def gen_image(prompt, quality, out):
-    key = os.environ.get('OPENAI_API_KEY2') or os.environ['OPENAI_API_KEY']
-    r = http_retry(lambda: requests.post(
-        'https://api.openai.com/v1/images/generations',
-        headers={'Authorization': f'Bearer {key}'},
-        json={'model': OPENAI_IMAGE_MODEL, 'prompt': prompt, 'size': '1536x1024',
-              'quality': quality, 'output_format': 'jpeg', 'output_compression': 85, 'n': 1},
-        timeout=240), what="image")
+    # try every OpenAI key in order; move on to the next one only on billing/auth problems
+    last = None
+    for key in openai_keys():
+        try:
+            r = http_retry(lambda: requests.post(
+                'https://api.openai.com/v1/images/generations',
+                headers={'Authorization': f'Bearer {key}'},
+                json={'model': OPENAI_IMAGE_MODEL, 'prompt': prompt, 'size': '1536x1024',
+                      'quality': quality, 'output_format': 'jpeg', 'output_compression': 85, 'n': 1},
+                timeout=240), what="image")
+            break
+        except RuntimeError as e:
+            last = e
+            msg = str(e).lower()
+            if not re.search(r'\b(401|402|403)\b|insufficient_quota|billing|exceeded your current quota', msg):
+                raise
+    else:
+        raise last
     b64 = r.json()['data'][0]['b64_json']
     with open(out + '.tmp', 'wb') as f:
         f.write(base64.b64decode(b64))
