@@ -1273,7 +1273,7 @@ def compile_thumbnail_preview(cid):
 # voiceover itself, so n8n only sends the script. Uses the compile
 # folders and status, so /compile/<id>, /compile/<id>/youtube and
 # /compile/<id>/thumbnail work for these jobs too.
-# Env: OPENAI_API_KEY, ELEVEN_API_KEY_LONG (or ELEVEN_API_KEY)
+# Env: OPENAI_API_KEY2 (preferred) or OPENAI_API_KEY, ELEVEN_API_KEY_LONG (or ELEVEN_API_KEY)
 # =====================================================================
 
 def http_retry(fn, tries=5, wait=20, what="request"):
@@ -1316,7 +1316,7 @@ def preflight():
 
 
 def gen_image(prompt, quality, out):
-    key = os.environ['OPENAI_API_KEY']
+    key = os.environ.get('OPENAI_API_KEY2') or os.environ['OPENAI_API_KEY']
     r = http_retry(lambda: requests.post(
         'https://api.openai.com/v1/images/generations',
         headers={'Authorization': f'Bearer {key}'},
