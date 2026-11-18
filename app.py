@@ -6,6 +6,7 @@ import glob
 import random
 import base64
 import json
+import hmac
 import shutil
 import threading
 import logging
@@ -15,6 +16,29 @@ import requests
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = app.logger
+
+# ---------- access control ----------
+# Every route except the health check "/" requires the header X-API-Key: <APP_SECRET>.
+# If APP_SECRET is not set the server stays open (so a deploy before the secret exists does not
+# break n8n) and logs a warning on every start.
+APP_SECRET = os.environ.get("APP_SECRET", "")
+
+
+@app.before_request
+def require_api_key():
+    if not APP_SECRET:
+        return None
+    if request.path == '/' or request.method == 'OPTIONS':
+        return None
+    given = request.headers.get('X-API-Key', '')
+    if hmac.compare_digest(given.encode('utf-8'), APP_SECRET.encode('utf-8')):
+        return None
+    log.warning(f"rejected {request.method} {request.path} from {request.headers.get('X-Forwarded-For', request.remote_addr)}")
+    return jsonify({"error": "unauthorized"}), 401
+
+
+if not APP_SECRET:
+    log.warning("APP_SECRET is not set: the API is OPEN. Set it in the Render environment.")
 
 # =====================================================================
 # Settings
